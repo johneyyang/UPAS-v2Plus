@@ -1,5 +1,6 @@
 # UPAS-v2Plus
-R codes for reading and parsing raw data from UPAS V2 Plus (firmware v81+)
+R codes for reading and plotting data from UPAS V2 Plus (firmware v81+) and R Shiny app to check wearing compliance
+
 
 read-plot-data:
     R function to read in a UPAS data file
