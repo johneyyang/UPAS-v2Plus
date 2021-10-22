@@ -1,0 +1,265 @@
+##  This is a R Shiny App for checking wearing compliance for a single UPAS data file.
+## Author: Qiang Yang
+## last accessed on 2021-10-20
+
+
+# load packages
+library(shiny)
+library(ggplot2)
+library(plotly)
+library(lubridate)
+library(dplyr)
+library(scales)
+library(grid)
+library(gridExtra)
+library(zoo)
+library(reshape2)
+library(readr)
+library(kableExtra)
+library(shinythemes)
+
+
+# request space for large files
+options(shiny.maxRequestSize=30*1024^2)
+
+
+# define individual plot theme
+theme_individual <- theme_bw() +
+  theme(aspect.ratio=3/6,
+        axis.text.y   = element_text(size=18),
+        axis.text.x   = element_text(size=15,angle = 60, hjust = 1),
+        axis.title.y  = element_text(size=18),
+        #axis.title.x  = element_text(size=18),
+        panel.background = element_blank(),
+        panel.grid.major = element_line(size=1, color="gray97", linetype="solid"),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color = "black"),
+        panel.border = element_rect(color = "black", fill=NA, size=1),
+        plot.title = element_text(size=18,hjust = 0.5),
+        legend.key = element_rect(fill = "white"),
+        legend.title = element_blank(),
+        legend.text = element_text(size=15))
+
+
+
+##########################
+####  User Interface  ####
+##########################
+ui <- fluidPage(theme = shinytheme("cosmo"),
+    # Application title
+    h1("UPAS v2 PLUS Data - Wearing Compliance Checking"),
+    
+    h4("v1 @2021-10-18"),
+
+    sidebarLayout(
+      
+      # side panel 
+      sidebarPanel(
+        div(fileInput(inputId = "input_datafile_1", 
+                      label = "Choose UPAS data file (.txt) from local drive to upload", 
+                      accept=c("txt")),
+            style = "font-size:120%; font-family:Arial"),
+        div(h4("* It may take up to 1 minute to upload the data and show the plot!"), 
+            style = "font-size:120%; font-family:Arial; color: red"),
+        tabPanel(title = "Summary1", 
+                 div(tableOutput("summary1"), 
+                     style = "font-size:150%")
+                 )
+                   ),    # end of sidebar Panel
+      
+      # main panel
+      mainPanel(
+        tabsetPanel(
+          tabPanel(title = "Time-series plots", 
+                 plotlyOutput("plotly_wear", width = "1200px", height = "720px"))
+          ) # end of tabset panel
+        ) # end of main Panel
+     ) # end of sidebar layout 
+  )  # end of fluid page
+
+
+
+##################
+####  Server  ####
+##################
+server <- function(input, output) ({
+    
+  Data <- reactive({
+      # read in data file
+      infile <- input$input_datafile_1
+      if (is.null(infile)) {
+        # User has not uploaded a file yet
+        return(NULL)
+      }
+      
+      function_read_UPAS_data <- function(filepath) {
+        data_parameter <- read_csv(file = filepath, col_names = T, n_max = 60)
+        data_column_name      <- read_csv(file = filepath, col_names = T, skip_empty_rows = T, skip = 88,  n_max = 0)
+        data_raw       <- read_csv(file = filepath, skip = 89, skip_empty_rows = T, col_names = T)
+        colnames(data_raw) <- colnames(data_column_name)
+        
+        data <- data_raw %>%
+          mutate(UPASserial = paste0("PSP", subset(data_parameter, PARAMETER == "UPASserial")$VALUE[1]),
+                 SubjectID = gsub("_", "", subset(data_parameter, PARAMETER == "SampleName")$VALUE[1]),
+                 FilterID = gsub("_", "", subset(data_parameter, PARAMETER == "CartridgeID")$VALUE[1]),
+                 DutyCycle  = subset(data_parameter, PARAMETER == "FlowDutyCycle")$VALUE[1],
+                 GPS_enabled = subset(data_parameter, PARAMETER == "GPSEnabled")$VALUE[1],
+                 log_interval = subset(data_parameter, PARAMETER == "LogInterval")$VALUE[1],
+                 powersave_mode = subset(data_parameter, PARAMETER == "PowerSaveMode")$VALUE[1],
+                 shutdown_mode = subset(data_parameter, PARAMETER == "ShutdownMode")$VALUE[1],
+                 compliance = ifelse((AccelXVar > 100) | (AccelYVar > 100) | (AccelZVar > 100), 1, 0)
+                 )
+        
+        data$compliance_rollmean <- ifelse(as.numeric(rollapply(data$compliance, width=20,  FUN = mean, align = "center", na.rm = TRUE, partial=F, fill = NA)) > 0, 1, 0)
+        data$compliance_ma <- as.numeric(rollapply(data$compliance, width=20,  FUN = mean, align = "center", na.rm = TRUE, partial=F, fill = NA))
+        
+        return(data)
+      }
+      
+      rawdata <- data.frame(function_read_UPAS_data(infile$datapath))
+      
+      
+      
+      rawdata_d1 <- subset(rawdata, DateTimeLocal < DateTimeLocal[1] + 24*3600)
+      rawdata_d2 <- subset(rawdata, DateTimeLocal >= DateTimeLocal[1] + 24*3600 & DateTimeLocal < DateTimeLocal[1] + 48*3600)
+      
+      
+      # data summary
+      data_summary1 <- data.frame(
+        
+        summary_variable = c("Subject_ID", 
+                              "Filter_ID", 
+                              "UPAS_serial_ID",
+                              
+                              "start date time", 
+                              "end date time", 
+                              "total run time", 
+                              "total wearing time",
+                             "first 24-hour wearing time",
+                             "second 24-hour wearing time",
+                             "average wearing time per day"
+                              ),
+        
+         summary_value = c(rawdata$SubjectID[1],
+                           rawdata$FilterID[1],
+                           rawdata$UPASserial[1],
+                           
+                           as.character(rawdata$DateTimeLocal[1]),
+                           as.character(rawdata$DateTimeLocal[nrow(rawdata)]),
+                           paste(round(nrow(rawdata)/2/60, digits = 1), " hours"),
+                           paste0(round(sum(rawdata$compliance_rollmean, na.rm = T)/2/60, digits = 1), " hours"),
+                           paste0(round(sum(rawdata_d1$compliance_rollmean, na.rm = T)/2/60, digits = 1), " hours"),
+                           paste0(round(sum(rawdata_d2$compliance_rollmean, na.rm = T)/2/60, digits = 1), " hours"),
+                           paste0(round(sum(rawdata$compliance_rollmean, na.rm = T)/nrow(rawdata)*24, digits = 1), " hours")
+                           )
+      ) # end of data_summary1
+      colnames(data_summary1) <- c("", "")
+      
+      d1_wearing <- round(sum(rawdata_d1$compliance_rollmean, na.rm = T)/2/60, digits = 1)
+      d2_wearing <- round(sum(rawdata_d2$compliance_rollmean, na.rm = T)/2/60, digits = 1)
+      
+      
+    return(list(rawdata = rawdata, data_summary1 = data_summary1, 
+                d1_wearing = d1_wearing, d2_wearing = d2_wearing))
+    }) # end of reactive Data
+    
+    
+
+# data summary
+    output$summary1 <- renderTable({ Data()$data_summary1 }) 
+
+
+
+# plots for display
+    output$plotly_wear <- renderPlotly({
+      
+      function_UPAS_plotly_wear <- function(df) {
+        
+        df$AccelX_SD <- ifelse(df$AccelXVar < 0, 0, sqrt(df$AccelXVar)/1000)
+        df$AccelY_SD <- ifelse(df$AccelYVar < 0, 0, sqrt(df$AccelYVar)/1000)
+        df$AccelZ_SD <- ifelse(df$AccelZVar < 0, 0, sqrt(df$AccelZVar)/1000)
+        
+
+        run_hours <- round(nrow(df)/2/60, 1)
+        wearing_hours <- round(sum(df$compliance_rollmean, na.rm=T)/2/60, 1)
+        
+        
+        plot_wear <- plot_ly() %>%
+          #add_trace(data = df, x=~DateTimeLocal, y=~compliance,    type = "scatter", mode  = "lines", line = list(color ="black"), name = "compliance", opacity=0.8)%>%            
+          add_trace(data = df, x=~DateTimeLocal, y=~compliance_rollmean, type = "scatter", mode  = "lines", 
+                    fill="tozeroy", fillcolor = "purple", line = list(color ="purple"), name = "wearing", opacity=0.9)%>%            
+          #add_trace(data = df, x=~DateTimeLocal, y=~compliance_ma,    type = "scatter", mode  = "lines", line = list(color ="black"), name = "wearing_moving_average", opacity=0.9)%>%            
+          layout(xaxis = list(tickangle = -0), 
+                 margin=list(l = 100),
+                 yaxis = list(title="Wearing", tickprefix="   ", 
+                              ticktext = list("not worn", "worn"), 
+                              tickvals = list(0, 1),
+                              tickmode = "array"),
+                 showlegend = T, 
+                 shapes = list(type = "rect",
+                               fillcolor = "silver", line = list(color = "silver"), opacity = 0.5,
+                               x0 = df$DateTimeLocal[1]+24*3600, x1 = df$DateTimeLocal[1] + 48*3600, xref = "x",
+                               y0 = 0, y1 = 1.5, yref = "y"),
+                 font = list(size=16))
+        
+        plot_activity <- plot_ly() %>%
+          add_trace(data = df, x=~DateTimeLocal, y=~AccelX_SD,    type = "scatter", mode  = "lines", line = list(color ="pink"), name = "Accel-X SD (g)", opacity=0.8)%>%            
+          add_trace(data = df, x=~DateTimeLocal, y=~AccelY_SD,    type = "scatter", mode  = "lines", line = list(color ="lightgreen"), name = "Accel-Y SD (g)", opacity=0.8)%>%            
+          add_trace(data = df, x=~DateTimeLocal, y=~AccelZ_SD,    type = "scatter", mode  = "lines", line = list(color ="lightblue"), name = "Accel-Z SD (g)", opacity=0.8)%>%            
+          layout(xaxis = list(tickangle = -0), 
+                 margin=list(l = 100),
+                 yaxis = list(title="Accelerometer", tickprefix="   "),
+                 showlegend = T, 
+                 shapes = list(type = "rect",
+                               fillcolor = "silver", line = list(color = "silver"), opacity = 0.5,
+                               x0 = df$DateTimeLocal[1]+24*3600, x1 = df$DateTimeLocal[1] + 48*3600, xref = "x",
+                               y0 = 0, y1 = 1, yref = "y"),
+                 font = list(size=16))
+        
+        title <- paste0("UPAS: ", df$UPASserial[1], ", total run hour = ", run_hours, ", total wearing hour = ", 
+                        wearing_hours)
+        d1_text <- "<----- first 24 hour period ----->"
+        d2_text <- "<----- second 24 hour period ----->"
+        d1_wearing_text <- paste0("worn for ", Data()$d1_wearing, " hours")
+        d2_wearing_text <- paste0("worn for ", Data()$d2_wearing, " hours")
+        
+        subplot(plot_wear,
+                plot_activity,
+
+                nrows = 2, 
+                heights = c(0.5, 0.5), 
+                #margin = c(0.04, 0.04, 0.04, 0.04), 
+                shareX = T, 
+                titleX = F, 
+                titleY = T) %>% 
+          layout(annotations = list(list(x = 0.01 , y = 1.00, text = d1_text,
+                                         font = list(size = 20, color = "black"), 
+                                         showarrow = F, 
+                                         xref='paper', yref='paper'),
+                                    list(x = 0.9 , y = 1.00, text = d2_text,
+                                         font = list(size = 20, color = "black"), 
+                                         showarrow = F, 
+                                         xref='paper', yref='paper'),
+                                    list(x = 0.1 , y = 0.95, text = d1_wearing_text,
+                                         font = list(size = 20, color = ifelse(Data()$d1_wearing >= 10, "green", "red")), 
+                                         showarrow = F, 
+                                         xref='paper', yref='paper'),
+                                    list(x = 0.75 , y = 0.95, text = d2_wearing_text,
+                                         font = list(size = 20, color = ifelse(Data()$d2_wearing >= 10, "green", "red")), 
+                                         showarrow = F, 
+                                         xref='paper', yref='paper')
+                                    ),
+                 font = list(size=16))
+        } # end of function_UPAS_plotly_all_parameters
+      
+      function_UPAS_plotly_wear(Data()$rawdata)
+      
+    }) # end of plot_all
+    
+}) # end of server
+  
+  
+ 
+
+## run Shiny App
+shinyApp(ui, server)
